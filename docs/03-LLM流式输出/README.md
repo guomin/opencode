@@ -174,7 +174,16 @@ for await (const value of stream.fullStream) {
 
 ## 事件类型详解
 
-AI SDK返回的事件类型有很多，这里介绍最常用的几种：
+AI SDK返回的事件类型有很多，这里介绍最常用的几种。
+
+> **💡 核心机制：事件是如何判断出来的？**
+> 
+> OpenCode 并没有自己手写正则或 JSON 解析器来处理底层数据流，而是完全依赖了 **Vercel AI SDK** 的标准化能力：
+> 1. **抹平差异**：各大模型厂商（OpenAI, Anthropic 等）返回的 SSE (Server-Sent Events) 数据格式各不相同。Vercel AI SDK 底层的 Provider 负责监听这些原始 HTTP Stream。
+> 2. **实时解析**：SDK 实时解析厂商的数据流，将其翻译成统一的、标准化的事件对象（如 `text-delta`, `tool-call`）。
+> 3. **自动执行**：对于工具调用，SDK 会在后台自动执行传入的工具函数，并在执行完毕后抛出 `tool-result` 事件。
+> 
+> 这种设计极大地解耦了“模型 API 解析”和“业务逻辑处理”，使得 OpenCode 可以非常轻松地接入各种不同的新模型。
 
 ### 1. start 事件
 

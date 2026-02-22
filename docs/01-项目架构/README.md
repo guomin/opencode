@@ -210,6 +210,40 @@ packages/util/
 | **Solid.js** | Web前端框架 | latest |
 | **Vite** | 前端构建工具 | latest |
 
+> **💡 深入了解：OpenCode 的第三方依赖与自研组件**
+> 
+> OpenCode 在基础能力上大量借助了优秀的第三方开源库，但其真正的核心竞争力在于自研的工程化架构。
+> 
+> **主要第三方依赖：**
+> - **AI 交互**: `ai` (Vercel AI SDK) 用于统一对接大模型并处理流式输出。
+> - **前端 UI**: `solid-js`, `@kobalte/core`, `tailwindcss`, `virtua` (虚拟列表)。
+> - **后端 API**: `hono`, `zod` (数据校验)。
+> - **文本与代码**: `marked` (Markdown), `shiki` (代码高亮), `tree-sitter` (语法解析)。
+> 
+> **核心自研组件 (`packages/opencode/src/`)：**
+> 
+> OpenCode 的核心壁垒并不在于“如何调用大模型 API”，而在于它构建了一套完整的、工程化的 AI 编程基础设施：
+> 
+> 1. **会话与状态管理 (`session/`)**：
+>    - `processor.ts`: 负责处理 AI SDK 吐出的事件流，并将其转换为内部的 `Part` 状态。
+>    - `compaction.ts`: **核心亮点**。当上下文过长时，负责自动压缩历史对话，防止 Token 溢出。
+>    - `storage/`: 本地存储引擎，将会话状态、消息、配置等持久化到本地文件系统。
+> 
+> 2. **工具与执行引擎 (`tool/`, `shell/`, `pty/`)**：
+>    - 赋予 AI 安全、可控的本地执行能力。定义了 AI 可以调用的各种工具（如 `bash`, `read_file` 等），并在本地安全地执行 Shell 命令并捕获输出。
+> 
+> 3. **版本控制与安全 (`snapshot/`, `patch/`, `permission/`)**：
+>    - **核心亮点**。在 AI 修改代码前后，自动创建文件快照（Snapshot），并生成差异补丁（Patch），用于实现代码修改的预览和回滚。
+>    - 权限控制系统负责拦截危险操作（如删除重要文件、执行高危命令），并向用户弹窗请求授权。
+> 
+> 4. **代理与协议 (`agent/`, `mcp/`, `lsp/`)**：
+>    - 定义了不同角色的 AI Agent（如 Coder, Reviewer 等）。
+>    - 实现了 MCP (Model Context Protocol) 协议，允许 OpenCode 作为一个 Server 提供上下文，或者作为一个 Client 连接其他 MCP Server。
+>    - 集成 LSP (Language Server Protocol)，允许 AI 获取代码的语法树、定义跳转等深度上下文。
+> 
+> 5. **事件驱动架构 (`bus/`)**：
+>    - **核心亮点**。实现了组件之间的解耦通信，例如 `SessionProcessor` 产生状态变更后，通过 `Bus` 广播，多端 UI（CLI, Web, IDE）订阅并更新。
+
 ### Web框架
 
 | 技术 | 用途 | 位置 |
