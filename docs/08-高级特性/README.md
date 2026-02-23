@@ -298,3 +298,64 @@ OAuth 凭证存储在 `mcp-auth.json`（见 `packages/opencode/src/mcp/auth.ts`�
 
 - “策略”用 Agent 表达（权限/模型/步数/提示词）
 - “能力”用 tools/resources/prompts 表达（其中 MCP 是外部能力的一等接入方式）
+
+---
+
+## 9. 附录：端到端时序图（Mermaid）
+
+下面这张图把三条常见路径放在同一张时序图里：
+
+- 主会话的常规一轮（resolve tools → LLM tool-call → 执行）
+- 用户通过 `@agent` 触发 `task` 工具创建子会话
+- MCP remote 需要 OAuth 时的认证分支、以及 MCP resource 的读取分支
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant SP as SessionPrompt.prompt()
+  participant A as Agent.get()/policy
+  participant TR as ToolRegistry
+  participant MCP as MCP (client manager)
+  participant LLM as Model (Vercel AI SDK)
+  participant TT as Tool: task
+  participant SS as Sub-session
+  participant CB as McpOAuthCallback
+  participant B as Browser
+
+  U->>SP: 输入消息（可包含 @agent / MCP resource）
+  SP->>A: 选择 agent/model/variant/steps
+  SP->>TR: 收集本地 tools
+  SP->>MCP: MCP.tools()（仅 connected server）
+  SP->>LLM: 发送 system+messages+tools
+
+  alt LLM 调用 MCP tool
+    LLM->>MCP: client.callTool(name,args)
+    MCP-->>LLM: CallToolResult（可能分段进度）
+  else LLM 调用本地 tool
+    LLM->>TR: tool.execute(args)
+    TR-->>LLM: tool result（含 Truncate + metadata）
+  end
+
+  alt 用户使用 @agent（part.type=agent）
+    SP->>TT: 调用 task(subagent_type,prompt)
+    TT->>SS: Session.create(parentID=主会话)
+    TT->>SP: SessionPrompt.prompt(子会话)
+    SP-->>TT: 子会话输出/摘要
+    TT-->>LLM: task tool output（带 task_id）
+  end
+
+  alt 用户提供 MCP resource（FilePart.source=resource）
+    SP->>MCP: readResource(client, uri)
+    MCP-->>SP: contents(text/blob)
+    SP-->>LLM: 将 text 注入为 synthetic parts
+  end
+
+  opt MCP remote 首次连接需要 OAuth（status=needs_auth）
+    MCP->>CB: ensureRunning()（本地回调 server）
+    MCP->>B: open(authorizationUrl)
+    B-->>CB: callback?code=...&state=...
+    CB-->>MCP: code（校验 state）
+    MCP->>MCP: finishAuth(code) + reconnect(add)
+  end
+```
