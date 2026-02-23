@@ -284,6 +284,32 @@ OAuth 凭证存储在 `mcp-auth.json`（见 `packages/opencode/src/mcp/auth.ts`�
 
 ---
 
+## 附：LSP 集成（语义定位与诊断闭环）
+
+LSP（Language Server Protocol）是“编辑器/工具 ↔ 语言智能服务（language server）”之间的标准协议，用来提供：跳转定义、找引用、hover 类型信息、符号索引、诊断（语法/类型错误）等能力。
+
+在 OpenCode 的 **Agent & 工具系统**里，LSP 的作用主要有两类：
+
+1) **语义级定位**（比 grep 更准）
+- 通过内置 `lsp` 工具提供 `goToDefinition/findReferences/hover/documentSymbol/workspaceSymbol/...`
+- 典型场景：追调用链、评估改动影响面、跨文件跳转定位实现
+- 代码：`packages/opencode/src/tool/lsp.ts`
+
+2) **改代码后的诊断闭环**（让 Agent 自己把错误修到过关）
+- `edit/write/apply_patch` 等改文件工具在落盘后会 `LSP.touchFile(...)` + `LSP.diagnostics()`
+- 如果检测到 severity=error，会把摘要以 `<diagnostics ...>` 形式拼进 tool output，驱动模型继续修复
+- 代码：`packages/opencode/src/tool/edit.ts`、`packages/opencode/src/tool/write.ts`、`packages/opencode/src/tool/apply_patch.ts`
+
+初始化与可观测性：
+- 实例启动会 `await LSP.init()`：`packages/opencode/src/project/bootstrap.ts`
+- Server 暴露 `GET /lsp` 状态：`packages/opencode/src/server/server.ts`（SDK 侧生成 `client.lsp.status()`）
+
+### Agent 什么时候用 LSP vs grep/read？（简版决策）
+
+- **不知道入口在哪**：先用 `glob/list` 找范围，再用 `grep` 找字符串/事件名/路由
+- **需要“原文证据”**：用 `read` 精确读文件片段（准备 patch/解释逻辑时必需）
+- **需要“符号关系”**：用 `lsp`（定义/引用/hover/符号），避免同名字符串/注释噪音
+
 ## 8. 总结：一条端到端链路
 
 把 Agent 与 MCP 放在一起看，核心是一条“会话驱动 → 工具注入 → 工具执行/资源读取”的链路：
