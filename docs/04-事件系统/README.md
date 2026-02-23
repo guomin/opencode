@@ -1,541 +1,249 @@
-# 事件系统详解
+# 事件驱动架构（Event System）
 
-事件系统是OpenCode组件间通信的核心机制，理解它对理解整个项目架构至关重要。
+事件系统不仅是“发布-订阅”，它还是 OpenCode 把 **LLM 流式输出、工具执行、权限/问答交互、文件/LSP 反馈** 串成可增量渲染系统的核心机制。
+
+这篇文档聚焦三个问题：
+
+1. 事件类型如何定义并保持可类型化（schema）？
+2. 事件如何在“实例内”分发，又如何跨实例传播到 UI/CLI？
+3. 端到端链路（Publish → SSE → Subscribe）在代码里在哪里？
 
 ## 📋 目录
 
-1. [什么是事件系统](#什么是事件系统)
-2. [事件类型定义](#事件类型定义)
-3. [事件发布机制](#事件发布机制)
-4. [事件订阅机制](#事件订阅机制)
-5. [完整的事件流](#完整的事件流)
-6. [实践练习](#实践练习)
+1. [事件数据模型](#事件数据模型)
+2. [三层结构：类型层 / 分发层 / 传播层](#三层结构类型层--分发层--传播层)
+3. [SSE：/event 与 /global/event](#sseevent-与-globalevent)
+4. [端到端时序](#端到端时序)
+5. [事件域速查](#事件域速查)
+6. [订阅模式与排错](#订阅模式与排错)
 
-## 什么是事件系统
+## 事件数据模型
 
-**概念**：事件系统是一种**发布-订阅**模式的通信机制。
+OpenCode 的事件负载形态非常简单：
 
-**类比**：
-- **发布者**（Publisher）：像广播电台，发送消息
-- **订阅者**（Subscriber）：像收音机，接收消息
-- **事件总线**（Bus）：像无线电波，传递消息
-
-**好处**：
-- **解耦**：组件之间不需要直接引用
-- **灵活**：可以随时添加/移除订阅者
-- **可扩展**：新增功能只需订阅相关事件
-
-## 事件类型定义
-
-### Session事件
-
-**代码位置**：`packages/opencode/src/session/index.ts:105-138`
-
-```typescript
-export const Event = {
-  Created: BusEvent.define(
-    "session.created",
-    z.object({
-      info: Info,
-    }),
-  ),
-  Updated: BusEvent.define(
-    "session.updated",
-    z.object({
-      info: Info,
-    }),
-  ),
-  Deleted: BusEvent.define(
-    "session.deleted",
-    z.object({
-      info: Info,
-    }),
-  ),
-  Diff: BusEvent.define(
-    "session.diff",
-    z.object({
-      sessionID: z.string(),
-      diff: Snapshot.FileDiff.array(),
-    }),
-  ),
-  Error: BusEvent.define(
-    "session.error",
-    z.object({
-      sessionID: z.string().optional(),
-      error: MessageV2.Assistant.shape.error,
-    }),
-  ),
+```ts
+type EventPayload = {
+  type: string
+  properties: Record<string, unknown>
 }
 ```
 
-**说明**：
-- `session.created`：Session创建时触发
-- `session.updated`：Session更新时触发
-- `session.deleted`：Session删除时触发
-- `session.diff`：生成文件差异时触发
-- `session.error`：发生错误时触发
+关键点在 `properties`：它不是随手塞一个对象，而是用 zod schema 定义并注册，最终可以聚合成一个 `discriminatedUnion`，用于 OpenAPI 与 SDK 的类型化事件流。
 
----
+## 三层结构：类型层 / 分发层 / 传播层
 
-### Message事件
+### 1) 类型层：BusEvent（事件定义 + schema 注册表）
 
-**代码位置**：`packages/opencode/src/session/message-v2.ts:401-424`
+代码位置：`packages/opencode/src/bus/bus-event.ts`
 
-```typescript
-export const Event = {
-  Updated: BusEvent.define(
-    "message.updated",
-    z.object({
-      info: Info,
-    }),
-  ),
-  Removed: BusEvent.define(
-    "message.removed",
-    z.object({
-      sessionID: z.string(),
-      messageID: z.string(),
-    }),
-  ),
-  PartUpdated: BusEvent.define(
-    "message.part.updated",  // ⭐ 最常用的事件！
-    z.object({
-      part: Part,
-      delta: z.string().optional(),
-    }),
-  ),
-  PartRemoved: BusEvent.define(
-    "message.part.removed",
-    z.object({
-      sessionID: z.string(),
-      messageID: z.string(),
-      partID: z.string(),
-    }),
-  ),
-}
-```
+- `BusEvent.define(type, schema)`：声明事件类型，并把 schema 存入 registry
+- `BusEvent.payloads()`：把 registry 聚合成 `z.discriminatedUnion("type", [...])`
 
-**说明**：
-- `message.updated`：Message更新时触发
-- `message.removed`：Message删除时触发
-- `message.part.updated`：Part更新时触发 ⭐ **最重要！**
-- `message.part.removed`：Part删除时触发
+实用心智模型：**“事件是否出现在事件流的类型联合里”，取决于对应模块有没有被 import（从而执行到 `define`）**。
 
----
+### 2) 分发层：Bus（实例内发布-订阅）
 
-### SessionStatus事件
+代码位置：`packages/opencode/src/bus/index.ts`
 
-**代码位置**：`packages/opencode/src/session/status.ts:27-42`
+Bus 的核心是：订阅表放在 `Instance.state()` 里。
 
-```typescript
-export const Event = {
-  Status: BusEvent.define(
-    "session.status",
-    z.object({
-      sessionID: z.string(),
-      status: Info,  // { type: "busy" | "retry" | "idle" }
-    }),
-  ),
-  Idle: BusEvent.define(
-    "session.idle",
-    z.object({
-      sessionID: z.string(),
-    }),
-  ),
-}
-```
+- 同一进程可能同时存在多个 Instance（不同 `directory`）
+- 每个 Instance 有自己独立的 subscriptions，避免跨项目/跨工作目录互相污染
 
-**说明**：
-- `session.status`：Session状态变化时触发
-- `session.idle`：Session空闲时触发
+订阅与发布 API：
 
----
+- `Bus.subscribe(def, cb)`：订阅某个具体 type
+- `Bus.subscribeAll(cb)`：订阅通配 `"*"`
+- `Bus.once(def, cb)`：一次性订阅
+- `Bus.publish(def, properties)`：发布事件
 
-### 其他事件
+发布时的分发规则：
 
-- **Todo.Event.Updated**：Todo列表更新
-- **SessionCompaction.Event.Compacted**：Session压缩完成
-- **Permission events**：权限请求/响应
+- 既投递给 `def.type` 的订阅者
+- 也投递给 `"*"` 的订阅者
 
-## 事件发布机制
+生命周期：
 
-### 发布位置
+- `Bus` 定义了 `server.instance.disposed`（`Bus.InstanceDisposed`）
+- 当 Instance dispose 时，会对通配订阅者投递一次 `server.instance.disposed`
+- 这让 SSE `/event` 可以在实例生命周期结束时自动断开
 
-**Session更新**：`packages/opencode/src/session/index.ts:229-246`
+### 3) 传播层：GlobalBus（跨实例/跨模块转发）
 
-```typescript
-export async function createNext(input: {...}) {
-  const result: Info = { ... }
+代码位置：
 
-  // 1. 保存到存储
-  await Storage.write(["session", project.id, result.id], result)
+- `packages/opencode/src/bus/global.ts`
+- `packages/opencode/src/server/routes/global.ts`
 
-  // 2. 发布事件 ⭐
-  Bus.publish(Event.Created, {
-    info: result,
-  })
+`GlobalBus` 是进程级 `EventEmitter`，承载跨实例传播：
 
-  // 3. 可能自动分享
-  if (!result.parentID && cfg.share === "auto") {
-    share(result.id)
-  }
+- `Bus.publish()` 内部会额外 `GlobalBus.emit("event", { directory: Instance.directory, payload })`
+- 一些不隶属于某个 Instance 的流程也会直接向 GlobalBus 发事件（例如 worktree 创建流程）：`packages/opencode/src/worktree/index.ts`
 
-  return result
-}
-```
+## SSE：/event 与 /global/event
 
-**Part更新**：`packages/opencode/src/session/index.ts:425-434`
+OpenCode 有两条 SSE 流，JSON shape 不同：
 
-```typescript
-export const updatePart = fn(UpdatePartInput, async (input) => {
-  const part = "delta" in input ? input.part : input
-  const delta = "delta" in input ? input.delta : undefined
+### /event（实例级事件流）
 
-  // 1. 保存到存储
-  await Storage.write(["part", part.messageID, part.id], part)
+代码位置：`packages/opencode/src/server/server.ts`
 
-  // 2. 发布事件 ⭐
-  Bus.publish(MessageV2.Event.PartUpdated, {
-    part,
-    delta,  // 增量文本
-  })
+- 路径：`GET /event`
+- 输出：`EventPayload`（`{ type, properties }`）
+- 来源：`Bus.subscribeAll()`（实例内通配订阅）
+- 断开：收到 `server.instance.disposed` 时 `stream.close()`
+- keep-alive：每 30s 发送 `server.heartbeat`
 
-  return part
+这条流通常对应“当前 directory 的那个 Instance”。
+
+### /global/event（全局级事件流）
+
+代码位置：`packages/opencode/src/server/routes/global.ts`（由 `packages/opencode/src/server/server.ts` 挂载在 `/global` 下）
+
+- 路径：`GET /global/event`
+- 输出：`{ directory, payload }`
+- 来源：`GlobalBus.on("event")`
+- keep-alive：每 30s 发送 `server.heartbeat`
+
+典型用途：跨多个实例观察（例如 worktree/sandbox 创建结果）。
+
+### SDK 侧
+
+JS SDK 里大致对应：
+
+```ts
+// 实例级
+const events = await client.event.subscribe({
+  query: {
+    directory,
+  },
 })
-```
+for await (const e of events.stream) {
+  // e: { type, properties }
+}
 
-**Message更新**：`packages/opencode/src/session/index.ts:373-379`
-
-```typescript
-export const updateMessage = fn(MessageV2.Info, async (msg) => {
-  await Storage.write(["message", msg.sessionID, msg.id], msg)
-
-  // 发布事件
-  Bus.publish(MessageV2.Event.Updated, {
-    info: msg,
-  })
-
-  return msg
-})
-```
-
-### 何时发布事件
-
-| 操作 | 发布的事件 | 时机 |
-|------|-----------|------|
-| 创建Session | `session.created` | Session.create() |
-| 更新Session | `session.updated` | Session.update() |
-| 删除Session | `session.deleted` | Session.remove() |
-| 创建Message | `message.updated` | MessageV2.create() |
-| 更新Message | `message.updated` | Session.updateMessage() |
-| 删除Message | `message.removed` | Session.removeMessage() |
-| **更新Part** | **`message.part.updated`** | **Session.updatePart() ⭐** |
-| 删除Part | `message.part.removed` | Session.removePart() |
-
-## 事件订阅机制
-
-### 订阅示例1：分享服务
-
-**代码位置**：`packages/opencode/src/share/share.ts:50-66`
-
-```typescript
-export function init() {
-  // 订阅Session更新事件
-  Bus.subscribe(Session.Event.Updated, async (evt) => {
-    await sync("session/info/" + evt.properties.info.id, evt.properties.info)
-  })
-
-  // 订阅Message更新事件
-  Bus.subscribe(MessageV2.Event.Updated, async (evt) => {
-    await sync("session/message/" + evt.properties.info.sessionID + "/" + evt.properties.info.id, evt.properties.info)
-  })
-
-  // 订阅Part更新事件
-  Bus.subscribe(MessageV2.Event.PartUpdated, async (evt) => {
-    await sync(
-      "session/part/" +
-        evt.properties.part.sessionID + "/" +
-        evt.properties.part.messageID + "/" +
-        evt.properties.part.id,
-      evt.properties.part
-    )
-  })
+// 全局级
+const events2 = await client.global.event()
+for await (const e of events2.stream) {
+  // e: { directory, payload: { type, properties } }
 }
 ```
 
-**作用**：将session/message/part同步到云端分享服务
+## 端到端时序
 
----
+最典型、频率最高的事件是 `message.part.updated`：LLM 的 token/delta、工具状态变更、步骤开始/结束，都会以 Part 的形式被更新并广播。
 
-### 订阅示例2：Task工具
+### 实例内：LLM 流式 → Bus → /event → UI/CLI
 
-**代码位置**：`packages/opencode/src/tool/task.ts:117-127`
+```mermaid
+sequenceDiagram
+  participant LLM as LLM Stream
+  participant S as Session
+  participant St as Storage
+  participant B as Bus (Instance)
+  participant SSE as GET /event
+  participant UI as UI/CLI
 
-```typescript
-// 订阅Part更新事件，追踪子任务进度
-const unsub = Bus.subscribe(MessageV2.Event.PartUpdated, async (evt) => {
-  if (evt.properties.part.sessionID !== session.id) return  // 过滤：只关心当前session
-  if (evt.properties.part.messageID === messageID) return   // 过滤：忽略当前消息
-  if (evt.properties.part.type !== "tool") return           // 过滤：只关心工具
-
-  const part = evt.properties.part
-  parts[part.id] = {
-    id: part.id,
-    tool: part.tool,
-    state: {
-      status: part.state.status,
-      title: part.state.status === "completed" ? part.state.title : undefined,
-    },
-  }
-
-  // 更新元数据，显示在主session中
-  ctx.metadata({
-    title: params.description,
-    metadata: { summary: Object.values(parts) }
-  })
-})
+  LLM->>S: updatePart(delta)
+  S->>St: write(part)
+  S->>B: publish(message.part.updated)
+  B-->>SSE: subscribeAll handler writes SSE
+  SSE-->>UI: { type, properties }
+  UI->>UI: filter + incremental render
 ```
 
-**作用**：Task工具追踪子session中的工具执行进度
+### 端到端主线索引（按代码落点）
 
----
+下面两条主线，是你在调试/扩展 UI 或 CLI 时最常需要追的：
 
-### 订阅示例3：CLI终端
+#### A) `message.part.updated`（流式文本 / 工具状态 / step 进度）
 
-**代码位置**：`packages/opencode/src/cli/cmd/run.ts:157-228`
+1. 事件定义：`BusEvent.define("message.part.updated", ...)`
+   - `packages/opencode/src/session/message-v2.ts`
+2. 发布点：`Session.updatePart()` 写入 Storage 后 `Bus.publish(MessageV2.Event.PartUpdated, ...)`
+   - `packages/opencode/src/session/index.ts`
+3. 实例内分发：`Bus.publish()` 投递给 `[def.type, "*"]` 的订阅者
+   - `packages/opencode/src/bus/index.ts`
+4. SSE 透传：服务端 `GET /event` 通过 `Bus.subscribeAll()` 把事件原样写到 SSE
+   - `packages/opencode/src/server/server.ts`
+5. SDK 订阅：`client.event.subscribe({ query: { directory } })`（SSE client）
+   - `packages/sdk/js/src/gen/sdk.gen.ts`
+6. CLI 消费：`opencode run` 在循环里分支处理 `message.part.updated`
+   - `packages/opencode/src/cli/cmd/run.ts`
 
-```typescript
-const events = await sdk.event.subscribe()
+#### B) `permission.asked` → `permission.reply`（权限交互闭环）
 
-for await (const event of events.stream) {
-  // 处理Part更新事件
-  if (event.type === "message.part.updated") {
-    const part = event.properties.part
+1. 事件定义：`permission.asked` / `permission.replied`
+   - `packages/opencode/src/permission/next.ts`
+2. 发布 asked（阻塞点）：`PermissionNext.ask()` 在需要询问时 `Bus.publish(Event.Asked, info)` 并返回 Promise 等待答复
+   - `packages/opencode/src/permission/next.ts`
+3. 事件透传：同样走 `GET /event` SSE（实例级通配订阅）
+   - `packages/opencode/src/server/server.ts`
+4. CLI 消费并答复：CLI 收到 `permission.asked` 后调用 `sdk.permission.reply(...)`
+   - `packages/opencode/src/cli/cmd/run.ts`
+5. HTTP 路由落地：`POST /permission/:requestID/reply` → `PermissionNext.reply(...)`
+   - `packages/opencode/src/server/routes/permission.ts`
+6. 发布 replied + resolve/reject：`PermissionNext.reply()` 内发布 `permission.replied`，并 `resolve()`/`reject()` 继续驱动后续流程
+   - `packages/opencode/src/permission/next.ts`
 
-    if (part.sessionID !== sessionID) continue  // 过滤
+### 跨实例：模块/后台任务 → GlobalBus → /global/event → UI
 
-    if (part.type === "tool" && part.state.status === "completed") {
-      // 显示工具执行结果
-      const [tool, color] = TOOL[part.tool] ?? [part.tool, UI.Style.TEXT_INFO_BOLD]
-      printEvent(color, tool, part.state.title || JSON.stringify(part.state.input))
-    }
+```mermaid
+sequenceDiagram
+  participant X as Producer (e.g. Worktree)
+  participant GB as GlobalBus
+  participant SSE as GET /global/event
+  participant UI as UI
 
-    if (part.type === "text" && part.time?.end) {
-      // 显示文本
-      process.stdout.write(part.text + EOL)
-    }
-  }
-
-  // 处理权限请求事件
-  if (event.type === "permission.asked") {
-    const result = await select({
-      message: `Permission required: ${permission.permission}`,
-      options: [
-        { value: "once", label: "Allow once" },
-        { value: "always", label: "Always allow" },
-        { value: "reject", label: "Reject" },
-      ],
-    })
-
-    await sdk.permission.respond({
-      sessionID,
-      permissionID: permission.id,
-      response: result,
-    })
-  }
-}
+  X->>GB: emit({ directory, payload })
+  GB-->>SSE: on("event") writes SSE
+  SSE-->>UI: { directory, payload }
 ```
 
-**作用**：CLI订阅事件，实时显示AI输出和工具执行结果
+## 事件域速查
 
-## 完整的事件流
+这里只列“系统里最常被消费、对 UI/CLI 增量渲染最关键”的事件域：
 
-### 场景：用户输入"创建一个txt文件"
+| 域 | 事件 type 示例 | 定义位置（定义者） | 典型用途 |
+|---|---|---|---|
+| Session | `session.created` `session.updated` `session.error` | `packages/opencode/src/session/index.ts` | 会话列表、错误提示 |
+| Message | `message.updated` `message.part.updated` | `packages/opencode/src/session/message-v2.ts` | LLM 流式输出、工具状态、增量 UI |
+| Status | `session.status` | `packages/opencode/src/session/status.ts` | busy/retry/idle 状态 |
+| Permission | `permission.asked` `permission.replied` | `packages/opencode/src/permission/next.ts` | 权限交互 |
+| Question | `question.asked` `question.replied` | `packages/opencode/src/question/index.ts` | 交互式问答 |
+| File Watcher | `file.watcher.updated` | `packages/opencode/src/file/watcher.ts` | 文件变更触发刷新 |
+| LSP | `lsp.updated` | `packages/opencode/src/lsp/index.ts` | 诊断刷新 |
+| Worktree | `worktree.ready` `worktree.failed` | `packages/opencode/src/worktree/index.ts` | worktree 创建结果 |
+| Server/Bus | `server.connected` `server.instance.disposed` | `packages/opencode/src/server/event.ts` / `packages/opencode/src/bus/index.ts` | SSE 握手/断开 |
 
-```
-用户: opencode run "创建一个txt文件"
-     ↓
-┌─────────────────────────────────────────────────┐
-│  1. 创建Session                                │
-│     Bus.publish(Event.Created, { info })       │
-└────────────┬────────────────────────────────────┘
-             │
-             ├─→ 分享服务订阅 → 同步到云端
-             └─→ UI订阅 → 更新session列表
-             │
-             ▼
-┌─────────────────────────────────────────────────┐
-│  2. 创建User Message                           │
-│     Bus.publish(Event.Updated, { info })       │
-└────────────┬────────────────────────────────────┘
-             │
-             ▼
-┌─────────────────────────────────────────────────┐
-│  3. LLM开始流式输出                            │
-│     ┌───────────────────────────────────────┐  │
-│     │ text-delta: "我"                       │  │
-│     │   → Session.updatePart({ text: "我" }) │  │
-│     │   → Bus.publish(PartUpdated)            │  │
-│     └───────────────────────────────────────┘  │
-│     ┌───────────────────────────────────────┐  │
-│     │ text-delta: "来"                      │  │
-│     │   → Session.updatePart({ text: "我来" })│  │
-│     │   → Bus.publish(PartUpdated)            │  │
-│     └───────────────────────────────────────┘  │
-└────────────┬────────────────────────────────────┘
-             │
-             ├────────────────────────────────┼─────────────┐
-             │                                │             │
-             ▼                                ▼             ▼
-        ┌─────────┐                      ┌─────────┐  ┌──────────┐
-        │ Web UI  │                      │ CLI UI  │  │Share服务  │
-        │         │                      │         │  │          │
-        │ 订阅    │                      │ 订阅    │  │ 订阅     │
-        │ PartUpdated                     │PartUpdated│  │PartUpdated│
-        │         │                      │         │  │          │
-        │ 显示: 我  │                      │显示: 我  │  │同步到云端│
-        │         │                      │         │  │          │
-        └─────────┘                      └─────────┘  └──────────┘
-```
+## 订阅模式与排错
 
-### 事件传播时序图
+### 1) 先订阅，再做业务过滤
 
-```
-SessionProcessor
-     │
-     │ Session.updatePart({ part })
-     │
-     ├─→ Storage.write() → 持久化
-     │
-     └─→ Bus.publish(PartUpdated, { part })
-          │
-          ├─→ [分享服务] 收到事件
-          │     └─→ sync到云端
-          │
-          ├─→ [CLI] 收到事件
-          │     └─→ 显示到终端
-          │
-          └─→ [Web UI] 收到事件
-                └─→ 更新界面
-```
+事件总线是解耦层，不负责替你筛选“哪个 session/哪个 message”。消费端通常要按需过滤：
 
-## 实践练习
+- `sessionID` 不匹配就忽略
+- `messageID` 不匹配就忽略
+- `part.type` 不关心就忽略（例如只看 `tool` 或只看 `text`）
 
-### 练习1：查看事件定义
+### 2) subscribeAll() 适合透传/日志
+
+`subscribeAll` 会收到该 Instance 的所有事件：
+
+- 服务端 `/event` SSE 透传就是这么做的
+- debug dump 也很方便
+
+业务逻辑建议订阅具体 type，再在 handler 内过滤。
+
+### 3) 快速定位“事件从哪来”
 
 ```bash
-# 搜索所有事件定义
-grep -r "BusEvent.define" packages/opencode/src/session/
+# 找事件定义
+rg "BusEvent\\.define\\(" packages/opencode/src
 
-# 输出：
-# packages/opencode/src/session/index.ts:     Session.Event
-# packages/opencode/src/session/message-v2.ts: MessageV2.Event
-# packages/opencode/src/session/status.ts:     SessionStatus.Event
-# packages/opencode/src/session/compaction.ts: SessionCompaction.Event
-# packages/opencode/src/session/todo.ts:       Todo.Event
+# 找发布点
+rg "Bus\\.publish\\(" packages/opencode/src
+
+# 找订阅点
+rg "Bus\\.subscribe" packages/opencode/src
 ```
-
-### 练习2：查看事件发布点
-
-```bash
-# 搜索所有事件发布
-grep -r "Bus.publish" packages/opencode/src/session/
-
-# 主要发布点：
-# Session.create() → session.created
-# Session.update() → session.updated
-# Session.updatePart() → message.part.updated ⭐
-# Session.updateMessage() → message.updated
-```
-
-### 练习3：查看事件订阅者
-
-```bash
-# 搜索所有事件订阅
-grep -r "Bus.subscribe" packages/opencode/src/
-
-# 主要订阅者：
-# packages/opencode/src/share/share.ts - 分享服务
-# packages/opencode/src/tool/task.ts - Task工具
-# packages/opencode/src/cli/cmd/github.ts - CLI GitHub工具
-```
-
-### 练习4：观察事件流
-
-```bash
-# 使用JSON格式输出，看所有事件
-opencode run "测试" --format json
-
-# 你会看到：
-{"type":"message.part.updated","properties":{"part":{...}}}
-{"type":"message.part.updated","properties":{"part":{...}}}
-...
-```
-
-### 练习5：添加自定义订阅（模拟）
-
-创建一个测试文件：
-
-```typescript
-// test-event-subscribe.ts
-import { Bus } from "./packages/opencode/src/bus"
-import { MessageV2 } from "./packages/opencode/src/session/message-v2"
-
-// 订阅Part更新事件
-const unsub = Bus.subscribe(MessageV2.Event.PartUpdated, (evt) => {
-  console.log("Part updated:", evt.properties.part.type)
-
-  if (evt.properties.part.type === "tool") {
-    console.log("Tool:", evt.properties.part.tool)
-    console.log("Status:", evt.properties.part.state.status)
-  }
-})
-
-// ... 运行一些代码 ...
-
-// 取消订阅
-unsub()
-```
-
-## 总结
-
-### 核心要点
-
-1. **事件驱动架构**：组件间通过事件通信，解耦合
-2. **发布-订阅模式**：
-   - 发布者：`Bus.publish(Event, data)`
-   - 订阅者：`Bus.subscribe(Event, handler)`
-3. **最常用事件**：`message.part.updated` ⭐
-4. **事件过滤**：订阅时根据sessionID、messageID等过滤
-5. **异步处理**：事件处理是异步的，不会阻塞发布者
-
-### 事件类型速查
-
-| 事件类型 | 发布时机 | 主要订阅者 |
-|---------|---------|-----------|
-| `session.created` | Session创建 | 分享服务、UI |
-| `session.updated` | Session更新 | 分享服务、UI |
-| `message.updated` | Message更新 | 分享服务 |
-| **`message.part.updated`** | **Part更新** ⭐ | **分享服务、CLI、Web UI** |
-| `session.status` | 状态变化 | CLI、Web UI |
-| `session.error` | 错误发生 | CLI、Web UI |
-| `permission.asked` | 权限请求 | CLI |
-
-### 学习路径
-
-1. ✅ 理解事件系统的概念
-2. ✅ 了解事件类型定义
-3. ✅ 掌握发布和订阅机制
-4. ⭐ **实践**：观察事件流
-5. ⭐ **实践**：查看发布和订阅代码
-
-### 下一步学习
-
-- [05-工具系统](../05-工具系统/) - 理解工具如何使用事件
-- [07-CLI和UI](../07-CLI和UI/) - 深入理解UI如何订阅事件
-
-### 相关代码文件
-
-- `packages/opencode/src/bus/bus-event.ts` - 事件定义
-- `packages/opencode/src/session/index.ts` - 事件发布
-- `packages/opencode/src/share/share.ts` - 订阅示例
-- `packages/opencode/src/cli/cmd/run.ts` - CLI订阅示例
